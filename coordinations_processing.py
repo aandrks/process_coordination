@@ -106,8 +106,13 @@ def parse_company_person_data(uploaded_file, db):
     company_person_map = defaultdict(list)
     new_employees = []
     seen_emails = {e['email'] for e in db['employees']}
-    processing_log = []
     team_id_counter = 1
+
+    # Initialize session state for manual assignments
+    if 'manual_assignments' not in st.session_state:
+        st.session_state.manual_assignments = {}
+    if 'processed_emails' not in st.session_state:
+        st.session_state.processed_emails = set()
 
     # Read uploaded file
     if uploaded_file.name.endswith('.csv'):
@@ -141,7 +146,8 @@ def parse_company_person_data(uploaded_file, db):
     if current_combined_line:
         combined_lines.append(current_combined_line)
 
-    manual_assignments = {}
+    # Store found manual assignments in session state
+    temp_manual_assignments = {}
 
     for line_num, line in enumerate(combined_lines, 1):
         if not line.strip():
@@ -166,6 +172,10 @@ def parse_company_person_data(uploaded_file, db):
                 name, email = match.group(1).strip(), match.group(2).strip()
                 email = re.sub(r'[),.;]+$', '', email).strip()
 
+                # Skip if already processed in this session
+                if email in st.session_state.processed_emails:
+                    continue
+
                 if email in seen_emails:
                     continue
                 seen_emails.add(email)
@@ -176,8 +186,8 @@ def parse_company_person_data(uploaded_file, db):
                 normalized_name = normalize_text(name)
 
                 if domain in public_domains:
-                    # Store for manual assignment later
-                    manual_assignments[email] = {
+                    # Store for manual assignment
+                    temp_manual_assignments[email] = {
                         'name': name, 'email': email, 'normalized_name': normalized_name,
                         'surname': surname, 'given_names': given_names,
                         'team_id': team_id, 'team_emails': team_emails,
@@ -199,20 +209,45 @@ def parse_company_person_data(uploaded_file, db):
                         'surname': surname, 'given_names': given_names,
                         'team_id': team_id, 'team_emails': team_emails
                     })
+                    st.session_state.processed_emails.add(email)
 
-    # Handle manual assignments
-    if manual_assignments:
+    # Update session state with new manual assignments
+    for email, data in temp_manual_assignments.items():
+        if email not in st.session_state.manual_assignments:
+            st.session_state.manual_assignments[email] = data
+
+    # Handle manual assignments with persistent state
+    if st.session_state.manual_assignments:
         st.subheader("Manual Company Assignment Required")
-        for email, data in manual_assignments.items():
+        st.info(f"Found {len(st.session_state.manual_assignments)} employees needing company assignment")
+
+        # Track which assignments are completed in this run
+        completed_assignments = []
+
+        for email, data in st.session_state.manual_assignments.items():
+            if email in st.session_state.processed_emails:
+                continue
+
             st.write(f"**Employee:** {data['name']} <{data['email']}>")
             st.write(f"**From line:** {data['line']}")
 
-            company = st.text_input(f"Assign company for {data['name']}:", key=f"company_{email}")
-            if company and len(company) >= 2:
-                if team_company is None:
-                    team_company = company
-                    db['companies'].add(company)
+            # Use a unique key that persists across reruns
+            company_key = f"company_{email}"
+            company = st.text_input(f"Assign company for {data['name']}:",
+                                    key=company_key,
+                                    value=st.session_state.get(company_key, ""))
 
+            col1, col2 = st.columns([3, 1])
+            with col2:
+                if st.button("Skip", key=f"skip_{email}"):
+                    st.session_state.processed_emails.add(email)
+                    st.rerun()
+
+            if company and len(company) >= 2:
+                # Store the company in session state
+                st.session_state[company_key] = company
+
+                # Add to database
                 new_employees.append({
                     'name': data['name'], 'email': data['email'],
                     'normalized_name': data['normalized_name'],
@@ -227,8 +262,37 @@ def parse_company_person_data(uploaded_file, db):
                     'team_id': data['team_id'], 'team_emails': data['team_emails']
                 })
 
-    db['employees'].extend(new_employees)
-    save_employee_db(db)
+                db['companies'].add(company)
+                completed_assignments.append(email)
+                st.session_state.processed_emails.add(email)
+                st.success(f"✅ Assigned {data['name']} to {company}")
+
+                # Small delay to show success message
+                import time
+                time.sleep(0.5)
+                st.rerun()
+
+        # Remove completed assignments from the queue
+        for email in completed_assignments:
+            if email in st.session_state.manual_assignments:
+                del st.session_state.manual_assignments[email]
+
+    # Add a button to continue after manual assignments
+    if st.session_state.manual_assignments:
+        st.warning(f"⚠️ {len(st.session_state.manual_assignments)} employees still need company assignment")
+        if st.button("Continue Anyway (Skip Remaining)"):
+            # Mark all remaining as processed
+            for email in list(st.session_state.manual_assignments.keys()):
+                st.session_state.processed_emails.add(email)
+            st.session_state.manual_assignments.clear()
+            st.rerun()
+    else:
+        # Only save to database when all assignments are done
+        db['employees'].extend(new_employees)
+        save_employee_db(db)
+
+        if new_employees:
+            st.success(f"✅ Added {len(new_employees)} new employees to database")
 
     return db, company_person_map
 
@@ -461,6 +525,16 @@ def process_coordinations(df, company_person_map, selected_date):
 def main():
     st.set_page_config(page_title="Coordination Processing System", layout="wide")
     st.title("🎯 Coordination Processing System")
+
+
+    if st.sidebar.button("Reset Manual Assignments"):
+        if 'manual_assignments' in st.session_state:
+            st.session_state.manual_assignments.clear()
+        if 'processed_emails' in st.session_state:
+            st.session_state.processed_emails.clear()
+        st.success("Manual assignments reset!")
+        st.rerun()
+
 
     # Load employee database
     db = load_employee_db()
